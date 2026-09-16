@@ -1,0 +1,630 @@
+#!/usr/bin/env python3
+
+import json
+import os
+import subprocess
+import sys
+
+from dbus_next import Variant
+from dbus_next.aio import MessageBus
+from dbus_next.service import ServiceInterface, method
+
+
+BUS_NAME = "org.freedesktop.impl.portal.desktop.kfile"
+OBJECT_PATH = "/org/freedesktop/portal/desktop"
+INTERFACE = "org.freedesktop.impl.portal.FileChooser"
+
+HELPER = "/usr/local/bin/kfile-helper"
+
+
+# ============================================================
+# Logging
+# ============================================================
+
+def log(message):
+    print(
+        f"[xdg-desktop-portal-kfile] {message}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+# ============================================================
+# D-Bus helpers
+# ============================================================
+
+def get_option(options, name, default=None):
+    """
+    Get a value from a D-Bus a{sv} dictionary.
+
+    dbus-next returns Variant objects for values from a{sv}.
+    """
+    value = options.get(name)
+
+    if value is None:
+        return default
+
+    if isinstance(value, Variant):
+        return value.value
+
+    return value
+
+
+# ============================================================
+# Portal filter conversion
+# ============================================================
+
+def convert_filters(filters):
+    """
+    Convert portal filters:
+
+        a(sa(us))
+
+    into the JSON format expected by kfile-helper:
+
+        [
+            {
+                "name": "...",
+                "globs": [...],
+                "mimes": [...]
+            }
+        ]
+    """
+
+    if not filters:
+        return []
+
+    result = []
+
+    for filter_data in filters:
+        try:
+            name = str(filter_data[0])
+            entries = filter_data[1]
+        except (IndexError, TypeError):
+            continue
+
+        globs = []
+        mimes = []
+
+        for entry in entries:
+            try:
+                filter_type = int(entry[0])
+                value = str(entry[1])
+            except (IndexError, TypeError):
+                continue
+
+            if filter_type == 0:
+                globs.append(value)
+
+            elif filter_type == 1:
+                mimes.append(value)
+
+        result.append(
+            {
+                "name": name,
+                "globs": globs,
+                "mimes": mimes,
+            }
+        )
+
+    return result
+
+
+def convert_current_filter(current_filter):
+    """
+    Convert portal current_filter:
+
+        (sa(us))
+
+    into the filter name used by kfile-helper.
+    """
+
+    if not current_filter:
+        return ""
+
+    try:
+        return str(current_filter[0])
+
+    except (IndexError, TypeError):
+        return ""
+
+
+# ============================================================
+# Request construction
+# ============================================================
+
+def build_request(
+    operation,
+    options,
+    multiple=False,
+    current_name="",
+):
+    """
+    Build a JSON request for kfile-helper.
+    """
+
+    current_folder_raw = get_option(
+        options,
+        "current_folder",
+        None,
+    )
+
+    filters_raw = get_option(
+        options,
+        "filters",
+        [],
+    )
+
+    current_filter_raw = get_option(
+        options,
+        "current_filter",
+        None,
+    )
+
+    current_folder = ""
+
+    if current_folder_raw:
+        try:
+            if isinstance(current_folder_raw, bytes):
+                current_folder = current_folder_raw.decode(
+                    "utf-8",
+                    errors="replace",
+                )
+            else:
+                current_folder = str(current_folder_raw)
+
+        except Exception:
+            current_folder = ""
+
+    filters = convert_filters(
+        filters_raw
+    )
+
+    current_filter = convert_current_filter(
+        current_filter_raw
+    )
+
+    request = {
+        "operation": operation,
+        "multiple": bool(multiple),
+        "directory": current_folder,
+        "filters": filters,
+        "current_filter": current_filter,
+        "current_name": str(current_name),
+    }
+
+    return request
+
+
+# ============================================================
+# Helper execution
+# ============================================================
+
+def run_helper(request):
+    """
+    Execute kfile-helper and parse its JSON response.
+
+    Helper writes diagnostics to stderr and JSON to stdout.
+    """
+
+    log(
+        "Starting kfile-helper: "
+        + json.dumps(
+            request,
+            ensure_ascii=False,
+        )
+    )
+
+    try:
+        process = subprocess.run(
+            [HELPER],
+            input=json.dumps(
+                request,
+                ensure_ascii=False,
+            ) + "\n",
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=None,
+            check=False,
+        )
+
+    except OSError as exc:
+        log(
+            "Failed to start kfile-helper: "
+            + str(exc)
+        )
+        return None
+
+    if process.returncode != 0:
+        log(
+            "kfile-helper exited with code "
+            + str(process.returncode)
+        )
+
+    stdout = process.stdout.strip()
+
+    if not stdout:
+        log("kfile-helper returned no stdout")
+        return None
+
+    # kfile-helper should normally output only one JSON object.
+    # Search backwards so diagnostic lines cannot break parsing.
+    lines = stdout.splitlines()
+
+    response_line = None
+
+    for line in reversed(lines):
+        line = line.strip()
+
+        if not line:
+            continue
+
+        if line.startswith("{") and line.endswith("}"):
+            response_line = line
+            break
+
+    if response_line is None:
+        log(
+            "Could not find JSON response from kfile-helper"
+        )
+        log(
+            "Helper stdout: "
+            + repr(stdout)
+        )
+        return None
+
+    try:
+        response = json.loads(
+            response_line
+        )
+
+    except json.JSONDecodeError as exc:
+        log(
+            "Invalid JSON from kfile-helper: "
+            + str(exc)
+        )
+        return None
+
+    return response
+
+
+# ============================================================
+# Portal response construction
+# ============================================================
+
+def make_success_response(response):
+    """
+    Build a successful portal response.
+
+    Returns an a{sv} dictionary.
+    """
+
+    uris = response.get(
+        "uris",
+        [],
+    )
+
+    result = {
+        "uris": Variant(
+            "as",
+            list(uris),
+        ),
+    }
+
+    current_filter = response.get(
+        "current_filter"
+    )
+
+    if current_filter:
+        name = str(
+            current_filter.get(
+                "name",
+                "",
+            )
+        )
+
+        entries = []
+
+        for glob in current_filter.get(
+            "globs",
+            [],
+        ):
+            entries.append(
+                [
+                    0,
+                    str(glob),
+                ]
+            )
+
+        for mime in current_filter.get(
+            "mimes",
+            [],
+        ):
+            entries.append(
+                [
+                    1,
+                    str(mime),
+                ]
+            )
+
+        result["current_filter"] = Variant(
+            "(sa(us))",
+            [
+                name,
+                entries,
+            ],
+        )
+
+    return result
+
+
+# ============================================================
+# FileChooser D-Bus interface
+# ============================================================
+
+class FileChooser(ServiceInterface):
+
+    def __init__(self):
+        super().__init__(
+            INTERFACE
+        )
+
+        log("FileChooser interface initialized")
+
+    # --------------------------------------------------------
+    # OpenFile
+    # --------------------------------------------------------
+
+    @method(name="OpenFile")
+    async def open_file(
+        self,
+        handle: "o",
+        app_id: "s",
+        parent_window: "s",
+        title: "s",
+        options: "a{sv}",
+    ) -> "ua{sv}":
+
+        log(
+            "OpenFile requested by "
+            + repr(app_id)
+        )
+
+        multiple = bool(
+            get_option(
+                options,
+                "multiple",
+                False,
+            )
+        )
+
+        directory = bool(
+            get_option(
+                options,
+                "directory",
+                False,
+            )
+        )
+
+        if directory:
+            operation = "directory"
+
+        else:
+            operation = "open"
+
+        request = build_request(
+            operation=operation,
+            options=options,
+            multiple=multiple,
+        )
+
+        response = run_helper(
+            request
+        )
+
+        if response is None:
+            log("Helper failed")
+
+            return [
+                2,
+                {},
+            ]
+
+        if not response.get(
+            "accepted",
+            False,
+        ):
+            log("Dialog cancelled")
+
+            return [
+                1,
+                {},
+            ]
+
+        result = make_success_response(
+            response
+        )
+
+        return [
+            0,
+            result,
+        ]
+
+    # --------------------------------------------------------
+    # SaveFile
+    # --------------------------------------------------------
+
+    @method(name="SaveFile")
+    async def save_file(
+        self,
+        handle: "o",
+        app_id: "s",
+        parent_window: "s",
+        title: "s",
+        options: "a{sv}",
+    ) -> "ua{sv}":
+
+        log(
+            "SaveFile requested by "
+            + repr(app_id)
+        )
+
+        current_name = get_option(
+            options,
+            "current_name",
+            "",
+        )
+
+        request = build_request(
+            operation="save",
+            options=options,
+            multiple=False,
+            current_name=current_name,
+        )
+
+        response = run_helper(
+            request
+        )
+
+        if response is None:
+            log("Helper failed")
+
+            return [
+                2,
+                {},
+            ]
+
+        if not response.get(
+            "accepted",
+            False,
+        ):
+            log("Dialog cancelled")
+
+            return [
+                1,
+                {},
+            ]
+
+        result = make_success_response(
+            response
+        )
+
+        return [
+            0,
+            result,
+        ]
+
+    # --------------------------------------------------------
+    # SaveFiles
+    # --------------------------------------------------------
+
+    @method(name="SaveFiles")
+    async def save_files(
+        self,
+        handle: "o",
+        app_id: "s",
+        parent_window: "s",
+        title: "s",
+        options: "a{sv}",
+    ) -> "ua{sv}":
+
+        log(
+            "SaveFiles requested by "
+            + repr(app_id)
+        )
+
+        current_name = get_option(
+            options,
+            "current_name",
+            "",
+        )
+
+        request = build_request(
+            operation="save",
+            options=options,
+            multiple=True,
+            current_name=current_name,
+        )
+
+        response = run_helper(
+            request
+        )
+
+        if response is None:
+            log("Helper failed")
+
+            return [
+                2,
+                {},
+            ]
+
+        if not response.get(
+            "accepted",
+            False,
+        ):
+            log("Dialog cancelled")
+
+            return [
+                1,
+                {},
+            ]
+
+        result = make_success_response(
+            response
+        )
+
+        return [
+            0,
+            result,
+        ]
+
+
+# ============================================================
+# Main
+# ============================================================
+
+async def main():
+
+    log("Starting")
+
+    bus = await MessageBus().connect()
+
+    interface = FileChooser()
+
+    bus.export(
+        OBJECT_PATH,
+        interface,
+    )
+
+    await bus.request_name(
+        BUS_NAME
+    )
+
+    log(
+        "D-Bus name acquired: "
+        + BUS_NAME
+    )
+
+    log("Ready")
+
+    await bus.wait_for_disconnect()
+
+
+if __name__ == "__main__":
+
+    try:
+        import asyncio
+
+        asyncio.run(
+            main()
+        )
+
+    except KeyboardInterrupt:
+        pass
+
+    except Exception as exc:
+        log(
+            "Fatal error: "
+            + repr(exc)
+        )
+        raise
