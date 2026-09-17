@@ -4,6 +4,9 @@
 #include <QJsonObject>
 #include <QUrl>
 #include <QDir>
+#include <QFileInfo>
+#include <QLoggingCategory>
+#include <QPushButton>
 
 #include <KFileCustomDialog>
 #include <KFileFilter>
@@ -115,6 +118,88 @@ static QJsonObject filterToJson(const KFileFilter &filter)
 }
 
 
+static QJsonObject emptyFilterJson()
+{
+    QJsonObject result;
+
+    result["name"] = QString();
+    result["globs"] = QJsonArray();
+    result["mimes"] = QJsonArray();
+
+    return result;
+}
+
+
+// Builds the "current_filter" JSON value for the response,
+// regardless of whether any filters were supplied at all.
+static QJsonObject currentFilterToJson(
+    const QList<KFileFilter> &filters,
+    const KFileWidget *fileWidget)
+{
+    if (filters.isEmpty() || !fileWidget) {
+        return emptyFilterJson();
+    }
+
+    return filterToJson(fileWidget->currentFilter());
+}
+
+
+// ============================================================
+// File name safety
+// ============================================================
+
+// Reject file names that could escape the target directory.
+static bool isSafeFileName(const QString &name)
+{
+    if (name.isEmpty()) {
+        return false;
+    }
+
+    if (QDir::isAbsolutePath(name)) {
+        return false;
+    }
+
+    if (name.contains(QLatin1Char('/'))) {
+        return false;
+    }
+
+    if (name == QLatin1String(".") ||
+        name == QLatin1String("..")) {
+        return false;
+        }
+
+        return true;
+}
+
+
+// ============================================================
+// Local URI conversion
+// ============================================================
+
+static bool appendLocalFileUri(
+    QJsonArray &jsonUrls,
+    const QString &path)
+{
+    const QFileInfo fileInfo(path);
+
+    if (fileInfo.isAbsolute() == false) {
+        return false;
+    }
+
+    const QUrl url = QUrl::fromLocalFile(fileInfo.absoluteFilePath());
+
+    if (!url.isValid() || !url.isLocalFile()) {
+        return false;
+    }
+
+    jsonUrls.append(
+        url.toString(QUrl::FullyEncoded)
+    );
+
+    return true;
+}
+
+
 // ============================================================
 // Main
 // ============================================================
@@ -148,10 +233,8 @@ int main(int argc, char *argv[])
     if (parseError.error != QJsonParseError::NoError ||
         !document.isObject()) {
 
-        debug(
-            "JSON parse error: " +
-            parseError.errorString().toStdString()
-        );
+        debug("JSON parse error: " +
+        parseError.errorString().toStdString());
 
     QJsonObject response;
     response["accepted"] = false;
@@ -164,8 +247,7 @@ int main(int argc, char *argv[])
 
         debug("JSON parsed successfully");
 
-        const QJsonObject request =
-        document.object();
+        const QJsonObject request = document.object();
 
         // --------------------------------------------------------
         // Operation
@@ -174,14 +256,12 @@ int main(int argc, char *argv[])
         const QString operation =
         request.value("operation").toString();
 
-        debug(
-            "Operation: " +
-            operation.toStdString()
-        );
+        debug("Operation: " + operation.toStdString());
 
         if (operation != "open" &&
             operation != "save" &&
-            operation != "directory") {
+            operation != "directory" &&
+            operation != "save_files") {
 
             debug("Unknown operation");
 
@@ -195,7 +275,7 @@ int main(int argc, char *argv[])
             }
 
             // --------------------------------------------------------
-            // Create dialog
+            // Dialog
             // --------------------------------------------------------
 
             debug("Opening file dialog");
@@ -218,49 +298,88 @@ int main(int argc, char *argv[])
             }
 
             // --------------------------------------------------------
+            // Dialog title
+            // --------------------------------------------------------
+
+            const QString title =
+            request.value("title").toString();
+
+            if (!title.isEmpty()) {
+                debug("Title: " + title.toStdString());
+                dialog.setWindowTitle(title);
+            }
+
+            // --------------------------------------------------------
+            // Accept button label
+            // --------------------------------------------------------
+
+            const QString acceptLabel =
+            request.value("accept_label").toString();
+
+            if (!acceptLabel.isEmpty() && fileWidget->okButton()) {
+                debug("Accept label: " + acceptLabel.toStdString());
+                fileWidget->okButton()->setText(acceptLabel);
+            }
+
+            // --------------------------------------------------------
             // Selection mode
             // --------------------------------------------------------
 
             KFile::Modes mode;
 
-            if (operation == "directory") {
+            if (operation == "save_files") {
+                debug("Mode: save multiple files / select directory");
 
-                debug("Mode: directory");
-
-                mode =
-                KFile::Directory |
+                mode = KFile::Directory |
                 KFile::ExistingOnly |
                 KFile::LocalOnly;
 
-            } else if (operation == "save") {
+                fileWidget->setOperationMode(
+                    KFileWidget::Other
+                );
 
-                debug("Mode: save");
+            } else if (operation == "directory") {
+                debug("Mode: directory");
 
-                mode =
-                KFile::File |
+                mode = KFile::Directory |
+                KFile::ExistingOnly |
                 KFile::LocalOnly;
 
-            } else {
+                fileWidget->setOperationMode(
+                    KFileWidget::Other
+                );
 
+            } else if (operation == "save") {
+                debug("Mode: save");
+
+                mode = KFile::File |
+                KFile::LocalOnly;
+
+                fileWidget->setOperationMode(
+                    KFileWidget::Saving
+                );
+
+            } else {
                 const bool multiple =
                 request.value("multiple").toBool(false);
 
                 if (multiple) {
                     debug("Mode: multiple files");
 
-                    mode =
-                    KFile::Files |
+                    mode = KFile::Files |
                     KFile::ExistingOnly |
                     KFile::LocalOnly;
-
                 } else {
                     debug("Mode: single file");
 
-                    mode =
-                    KFile::File |
+                    mode = KFile::File |
                     KFile::ExistingOnly |
                     KFile::LocalOnly;
                 }
+
+                fileWidget->setOperationMode(
+                    KFileWidget::Opening
+                );
             }
 
             fileWidget->setMode(mode);
@@ -273,13 +392,10 @@ int main(int argc, char *argv[])
             request.value("directory").toString();
 
             if (!directory.isEmpty()) {
+                debug("Initial directory: " +
+                directory.toStdString());
 
-                debug(
-                    "Initial directory: " +
-                    directory.toStdString()
-                );
-
-                QUrl directoryUrl =
+                const QUrl directoryUrl =
                 QUrl::fromUserInput(directory);
 
                 if (directoryUrl.isLocalFile()) {
@@ -292,38 +408,53 @@ int main(int argc, char *argv[])
             // --------------------------------------------------------
 
             if (operation == "save") {
-
                 const QString currentName =
                 request.value("current_name").toString();
 
                 if (!currentName.isEmpty()) {
+                    debug("Current name: " +
+                    currentName.toStdString());
 
-                    debug(
-                        "Current name: " +
-                        currentName.toStdString()
-                    );
+                    if (!isSafeFileName(currentName)) {
+                        debug(
+                            "Rejected unsafe current_name, "
+                            "using base name only"
+                        );
+                    }
+
+                    const QString safeName =
+                    isSafeFileName(currentName)
+                    ? currentName
+                    : QFileInfo(currentName).fileName();
 
                     QUrl currentUrl;
 
-                    if (!directory.isEmpty()) {
+                    if (!directory.isEmpty() &&
+                        !safeName.isEmpty()) {
+
                         const QString localPath =
-                        QDir(directory).filePath(currentName);
+                        QDir(directory).filePath(safeName);
 
-                        currentUrl =
-                        QUrl::fromLocalFile(localPath);
-                    }
+                    currentUrl =
+                    QUrl::fromLocalFile(localPath);
+                        }
 
-                    if (currentUrl.isValid() &&
-                        currentUrl.isLocalFile()) {
-
-                        fileWidget->setSelectedUrl(currentUrl);
-
-                        } else {
+                        if (currentUrl.isValid() &&
+                            currentUrl.isLocalFile()) {
 
                             fileWidget->setSelectedUrl(
-                                QUrl::fromUserInput(currentName)
+                                currentUrl
                             );
-                        }
+
+                            } else if (!safeName.isEmpty()) {
+
+                                QUrl relativeUrl;
+                                relativeUrl.setPath(safeName);
+
+                                fileWidget->setSelectedUrl(
+                                    relativeUrl
+                                );
+                            }
                 }
 
                 // Let KDE ask before overwriting an existing file.
@@ -336,24 +467,20 @@ int main(int argc, char *argv[])
 
             QList<KFileFilter> filters;
 
-            int requestedCurrentFilter = -1;
-
             if (request.contains("filters") &&
                 request.value("filters").isArray()) {
 
-                filters =
-                parseFilters(
-                    request.value("filters").toArray(),
-                             requestedCurrentFilter
-                );
+                int requestedCurrentFilter = -1;
+
+            filters = parseFilters(
+                request.value("filters").toArray(),
+                                   requestedCurrentFilter
+            );
                 }
 
                 if (filters.isEmpty()) {
-
                     debug("No filters supplied");
-
                 } else {
-
                     debug(
                         "Received " +
                         std::to_string(filters.size()) +
@@ -363,14 +490,10 @@ int main(int argc, char *argv[])
                     int selectedFilter = 0;
 
                     const QString currentFilterName =
-                    request
-                    .value("current_filter")
-                    .toString();
+                    request.value("current_filter").toString();
 
                     if (!currentFilterName.isEmpty()) {
-
                         for (int i = 0; i < filters.size(); ++i) {
-
                             if (filters[i].label() ==
                                 currentFilterName) {
 
@@ -397,38 +520,26 @@ int main(int argc, char *argv[])
 
                 debug("Executing dialog");
 
-                const int result =
-                dialog.exec();
+                const int result = dialog.exec();
 
                 // --------------------------------------------------------
                 // Cancel
                 // --------------------------------------------------------
 
                 if (result != QDialog::Accepted) {
-
                     debug("Dialog rejected");
 
                     QJsonObject response;
 
                     response["accepted"] = false;
 
-                    QJsonObject currentFilter;
-
-                    if (!filters.isEmpty()) {
-                        currentFilter =
-                        filterToJson(
-                            fileWidget->currentFilter()
+                    if (operation != "save_files") {
+                        response["current_filter"] =
+                        currentFilterToJson(
+                            filters,
+                            fileWidget
                         );
-                    } else {
-                        currentFilter["name"] = "";
-                        currentFilter["globs"] =
-                        QJsonArray();
-                        currentFilter["mimes"] =
-                        QJsonArray();
                     }
-
-                    response["current_filter"] =
-                    currentFilter;
 
                     writeResponse(response);
 
@@ -438,6 +549,106 @@ int main(int argc, char *argv[])
                 }
 
                 debug("Dialog accepted");
+
+                // --------------------------------------------------------
+                // SaveFiles
+                // --------------------------------------------------------
+
+                if (operation == "save_files") {
+                    const QList<QUrl> selectedUrls =
+                    fileWidget->selectedUrls();
+
+                    if (selectedUrls.size() != 1 ||
+                        !selectedUrls.first().isLocalFile()) {
+
+                        debug(
+                            "SaveFiles did not return a local directory"
+                        );
+
+                    QJsonObject response;
+                    response["accepted"] = false;
+                    response["error"] = "invalid_save_directory";
+
+                    writeResponse(response);
+
+                    return 1;
+                        }
+
+                        const QString selectedDirectory =
+                        selectedUrls.first().toLocalFile();
+
+                        debug(
+                            "SaveFiles selected directory: " +
+                            selectedDirectory.toStdString()
+                        );
+
+                        const QJsonArray requestedFiles =
+                        request.value("files").toArray();
+
+                        QJsonArray jsonUrls;
+
+                        for (const QJsonValue &value : requestedFiles) {
+                            if (!value.isString()) {
+                                debug("Ignoring non-string SaveFiles entry");
+                                continue;
+                            }
+
+                            const QString fileName =
+                            value.toString();
+
+                            if (!isSafeFileName(fileName)) {
+                                debug(
+                                    "Rejected unsafe SaveFiles filename: " +
+                                    fileName.toStdString()
+                                );
+
+                                QJsonObject response;
+                                response["accepted"] = false;
+                                response["error"] = "invalid_filename";
+
+                                writeResponse(response);
+
+                                return 1;
+                            }
+
+                            const QString localPath =
+                            QDir(selectedDirectory).filePath(fileName);
+
+                            if (!appendLocalFileUri(
+                                jsonUrls,
+                                localPath)) {
+
+                                debug(
+                                    "Failed to construct local URI for: " +
+                                    localPath.toStdString()
+                                );
+
+                            QJsonObject response;
+                            response["accepted"] = false;
+                            response["error"] = "invalid_file_uri";
+
+                            writeResponse(response);
+
+                            return 1;
+                                }
+
+                                debug(
+                                    "SaveFiles URI: " +
+                                    jsonUrls.last().toString().toStdString()
+                                );
+                        }
+
+                        QJsonObject response;
+
+                        response["accepted"] = true;
+                        response["uris"] = jsonUrls;
+
+                        writeResponse(response);
+
+                        debug("Finished");
+
+                        return 0;
+                }
 
                 // --------------------------------------------------------
                 // Selected URLs
@@ -455,60 +666,97 @@ int main(int argc, char *argv[])
                 QJsonArray jsonUrls;
 
                 for (const QUrl &url : urls) {
-
                     debug(
                         "Selected URL: " +
                         url.toString().toStdString()
                     );
 
-                    jsonUrls.append(
-                        url.toString()
-                    );
+                    // Portal FileChooser results must be local file:// URIs.
+                    if (!url.isLocalFile()) {
+                        debug(
+                            "Discarding non-local selected URL: " +
+                            url.toString().toStdString()
+                        );
+
+                        continue;
+                    }
+
+                    const QString localPath =
+                    url.toLocalFile();
+
+                    const QUrl localUrl =
+                    QUrl::fromLocalFile(localPath);
+
+                    if (!localUrl.isValid() ||
+                        !localUrl.isLocalFile()) {
+
+                        debug(
+                            "Discarding invalid local URL: " +
+                            localPath.toStdString()
+                        );
+
+                    continue;
+                        }
+
+                        jsonUrls.append(
+                            localUrl.toString(
+                                QUrl::FullyEncoded
+                            )
+                        );
                 }
 
-                // --------------------------------------------------------
-                // Current filter
-                // --------------------------------------------------------
-
-                QJsonObject currentFilter;
-
-                if (!filters.isEmpty()) {
-
-                    currentFilter =
-                    filterToJson(
-                        fileWidget->currentFilter()
-                    );
+                // SaveFile must return exactly one URI.
+                if (operation == "save" &&
+                    jsonUrls.size() != 1) {
 
                     debug(
-                        "Current filter: " +
-                        currentFilter
-                        .value("name")
-                        .toString()
-                        .toStdString()
+                        "Save operation did not produce exactly "
+                        "one local URI"
                     );
-
-                } else {
-
-                    currentFilter["name"] = "";
-                    currentFilter["globs"] =
-                    QJsonArray();
-                    currentFilter["mimes"] =
-                    QJsonArray();
-                }
-
-                // --------------------------------------------------------
-                // Response
-                // --------------------------------------------------------
 
                 QJsonObject response;
 
-                response["accepted"] = true;
-                response["uris"] = jsonUrls;
-                response["current_filter"] = currentFilter;
+                response["accepted"] = false;
+                response["error"] = "invalid_save_result";
 
                 writeResponse(response);
 
-                debug("Finished");
+                return 1;
+                    }
 
-                return 0;
+                    // --------------------------------------------------------
+                    // Current filter
+                    // --------------------------------------------------------
+
+                    const QJsonObject currentFilter =
+                    currentFilterToJson(
+                        filters,
+                        fileWidget
+                    );
+
+                    if (!filters.isEmpty()) {
+                        debug(
+                            "Current filter: " +
+                            currentFilter
+                            .value("name")
+                            .toString()
+                            .toStdString()
+                        );
+                    }
+
+                    // --------------------------------------------------------
+                    // Response
+                    // --------------------------------------------------------
+
+                    QJsonObject response;
+
+                    response["accepted"] = true;
+                    response["uris"] = jsonUrls;
+                    response["current_filter"] = currentFilter;
+
+                    writeResponse(response);
+
+                    debug("Finished");
+
+                    return 0;
 }

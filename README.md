@@ -2,7 +2,13 @@
 
 A KDE `KFileWidget` / `KFileCustomDialog` backend for the
 `org.freedesktop.impl.portal.FileChooser` interface of `xdg-desktop-portal`,
-intended for Niri on Arch Linux.
+intended for Niri.
+
+The project targets Linux distributions in general. `install.sh` currently
+auto-detects `pacman` (Arch), `apt` (Debian/Ubuntu), `dnf` (Fedora) and
+`zypper` (openSUSE) to check and install build dependencies. The core
+programs (`kfile-helper` and the Python D-Bus backend) have no
+distribution-specific code.
 
 ## How it works
 
@@ -35,20 +41,34 @@ The backend provides:
 - MIME filters
 - Current filter
 - KDE/KIO file chooser UI
+- Request cancellation (`Close`)
+- Safe handling of the requested save file name (no path traversal)
+- Non-blocking backend: multiple concurrent dialog requests do not stall
+  each other
 
 ## Requirements
 
-Arch Linux packages:
+`install.sh` installs these automatically when possible, matched to the
+detected package manager:
 
-```text
-python
-python-dbus-next
-xdg-desktop-portal
-kio
-qt6-base
-cmake
-gcc
-```
+| Dependency                     | Arch (`pacman`)      | Debian/Ubuntu (`apt`) | Fedora (`dnf`)      | openSUSE (`zypper`)  |
+|---------------------------------|-----------------------|------------------------|-----------------------|-----------------------|
+| Python 3                        | `python`             | `python3`              | `python3`             | `python3`             |
+| `dbus-next` (Python)             | `python-dbus-next`   | `python3-dbus-next`    | `python3-dbus-next`   | `python3-dbus-next`   |
+| xdg-desktop-portal               | `xdg-desktop-portal` | `xdg-desktop-portal`   | `xdg-desktop-portal`  | `xdg-desktop-portal`  |
+| KDE Frameworks 6 KIO (dev files) | `kio`                | `libkf6kio-dev`        | `kf6-kio-devel`       | `kf6-kio-devel`       |
+| Qt6 base (dev files)             | `qt6-base`           | `qt6-base-dev`         | `qt6-qtbase-devel`    | `qt6-base-devel`      |
+| CMake                            | `cmake`              | `cmake`                | `cmake`               | `cmake`               |
+| C++ compiler                     | `gcc`                | `g++`                  | `gcc-c++`             | `gcc-c++`             |
+
+Exact package names may still differ between distribution versions and
+third-party repositories. If a package is not found under these names,
+install the equivalent development package for KDE Frameworks 6 KIO and Qt6
+Widgets manually, then re-run `./install.sh`.
+
+If no supported package manager is detected, `install.sh` skips automatic
+package checks/installation and prints the list of dependencies to install
+manually.
 
 ## Build
 
@@ -113,6 +133,18 @@ systemctl --user restart xdg-desktop-portal.service
 
 The backend is activated automatically through D-Bus. Do not start
 `xdg-desktop-portal-kfile` manually.
+
+## Request cancellation
+
+The backend implements `org.freedesktop.impl.portal.Request`. Every call to
+`OpenFile`, `SaveFile` or `SaveFiles` exports a `Request` object at the
+`handle` path supplied by the caller.
+
+If the calling application invokes `Close()` on that object before the user
+finishes the dialog, the backend terminates the running `kfile-helper`
+process and the pending D-Bus call returns as cancelled. This matches the
+behaviour expected by portal clients that cancel a request programmatically
+(for example, when the requesting window is closed).
 
 ## Niri configuration
 
@@ -187,3 +219,13 @@ UseIn=niri;
 ```
 
 so the backend is intended for Niri.
+
+## Known limitations
+
+- The dialog window is not marked as transient for the calling application
+  window (`parent_window` is currently ignored). The dialog therefore is not
+  guaranteed to stay above the calling application on all compositors.
+- A single dialog request runs for as long as the user needs; an internal
+  safety timeout (10 minutes) protects the backend from a crashed or
+  wedged `kfile-helper` process, automatically failing the request instead
+  of hanging the whole portal.

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 
+import asyncio
 import json
 import os
-import subprocess
+import signal
 import sys
 
 from dbus_next import Variant
@@ -13,8 +14,12 @@ from dbus_next.service import ServiceInterface, method
 BUS_NAME = "org.freedesktop.impl.portal.desktop.kfile"
 OBJECT_PATH = "/org/freedesktop/portal/desktop"
 INTERFACE = "org.freedesktop.impl.portal.FileChooser"
+REQUEST_INTERFACE = "org.freedesktop.impl.portal.Request"
 
 HELPER = "/usr/local/bin/kfile-helper"
+
+# Maximum time a helper process may remain open.
+HELPER_TIMEOUT = 600
 
 
 # ============================================================
@@ -27,6 +32,10 @@ def log(message):
         file=sys.stderr,
         flush=True,
     )
+
+
+def log_helper(pid, message):
+    log(f"[kfile-helper:{pid}] {message}")
 
 
 # ============================================================
@@ -51,6 +60,92 @@ def get_option(options, name, default=None):
 
 
 # ============================================================
+# Portal byte-array helpers
+# ============================================================
+
+def decode_path_bytes(value):
+    """
+    Decode a portal byte-array path using the local filesystem
+    encoding.
+
+    Portal byte arrays may contain trailing NUL bytes.
+    """
+    if value is None:
+        return ""
+
+    if isinstance(value, str):
+        return value.rstrip("\x00")
+
+    if isinstance(value, (bytes, bytearray)):
+        raw = bytes(value)
+
+        while raw.endswith(b"\x00"):
+            raw = raw[:-1]
+
+        return os.fsdecode(raw)
+
+    return str(value).rstrip("\x00")
+
+
+def decode_filename_list(value):
+    """
+    Decode SaveFiles' aay filename list.
+    """
+    if not value:
+        return []
+
+    result = []
+
+    for item in value:
+        filename = decode_path_bytes(item)
+
+        if filename:
+            result.append(filename)
+
+    return result
+
+
+# ============================================================
+# File URI handling
+# ============================================================
+
+def normalize_file_uri(uri):
+    """
+    Accept only local file:// URIs.
+
+    Remote URLs are intentionally rejected because this backend
+    is restricted to local KDE/KIO file selection.
+    """
+    if not isinstance(uri, str):
+        return None
+
+    if not uri.startswith("file:"):
+        return None
+
+    # file:///path
+    # file://localhost/path
+    if uri.startswith("file://localhost/"):
+        uri = "file://" + uri[len("file://localhost"):]
+
+    if not uri.startswith("file:///"):
+        return None
+
+    return uri
+
+
+def normalize_uris(uris):
+    result = []
+
+    for uri in uris:
+        normalized = normalize_file_uri(uri)
+
+        if normalized is not None:
+            result.append(normalized)
+
+    return result
+
+
+# ============================================================
 # Portal filter conversion
 # ============================================================
 
@@ -60,17 +155,8 @@ def convert_filters(filters):
 
         a(sa(us))
 
-    into the JSON format expected by kfile-helper:
-
-        [
-            {
-                "name": "...",
-                "globs": [...],
-                "mimes": [...]
-            }
-        ]
+    into the JSON format expected by kfile-helper.
     """
-
     if not filters:
         return []
 
@@ -95,7 +181,6 @@ def convert_filters(filters):
 
             if filter_type == 0:
                 globs.append(value)
-
             elif filter_type == 1:
                 mimes.append(value)
 
@@ -118,13 +203,11 @@ def convert_current_filter(current_filter):
 
     into the filter name used by kfile-helper.
     """
-
     if not current_filter:
         return ""
 
     try:
         return str(current_filter[0])
-
     except (IndexError, TypeError):
         return ""
 
@@ -136,13 +219,15 @@ def convert_current_filter(current_filter):
 def build_request(
     operation,
     options,
+    title="",
+    accept_label="",
     multiple=False,
     current_name="",
+    files=None,
 ):
     """
     Build a JSON request for kfile-helper.
     """
-
     current_folder_raw = get_option(
         options,
         "current_folder",
@@ -161,20 +246,9 @@ def build_request(
         None,
     )
 
-    current_folder = ""
-
-    if current_folder_raw:
-        try:
-            if isinstance(current_folder_raw, bytes):
-                current_folder = current_folder_raw.decode(
-                    "utf-8",
-                    errors="replace",
-                )
-            else:
-                current_folder = str(current_folder_raw)
-
-        except Exception:
-            current_folder = ""
+    current_folder = decode_path_bytes(
+        current_folder_raw
+    )
 
     filters = convert_filters(
         filters_raw
@@ -190,22 +264,109 @@ def build_request(
         "directory": current_folder,
         "filters": filters,
         "current_filter": current_filter,
-        "current_name": str(current_name),
+        "current_name": str(current_name or ""),
+        "title": str(title or ""),
+        "accept_label": str(accept_label or ""),
     }
+
+    if files is not None:
+        request["files"] = list(files)
 
     return request
 
 
 # ============================================================
-# Helper execution
+# Helper process management
 # ============================================================
 
-def run_helper(request):
+async def kill_process(process, reason=""):
+    """
+    Safely terminate a helper process.
+
+    ProcessLookupError is expected if the process exits between
+    checking returncode and sending the signal.
+    """
+    if process is None:
+        return
+
+    try:
+        if process.returncode is None:
+            if reason:
+                log_helper(
+                    process.pid,
+                    f"Terminating helper: {reason}",
+                )
+
+            process.kill()
+
+    except ProcessLookupError:
+        log_helper(
+            process.pid,
+            "Helper already exited",
+        )
+
+    except OSError as exc:
+        log_helper(
+            process.pid,
+            f"Failed to terminate helper: {exc}",
+        )
+
+
+async def read_helper_stderr(process):
+    """
+    Read helper stderr and prefix every diagnostic line with PID.
+
+    Keeping stderr in a pipe avoids mixing diagnostics from several
+    helper processes directly at the terminal/journal level.
+    """
+    if process.stderr is None:
+        return
+
+    try:
+        while True:
+            line = await process.stderr.readline()
+
+            if not line:
+                break
+
+            text = line.decode(
+                "utf-8",
+                errors="replace",
+            ).rstrip()
+
+            if text:
+                log_helper(
+                    process.pid,
+                    text,
+                )
+
+    except asyncio.CancelledError:
+        raise
+
+    except Exception as exc:
+        log_helper(
+            process.pid,
+            f"stderr reader failed: {exc}",
+        )
+
+
+async def run_helper(request, cancel_event=None):
     """
     Execute kfile-helper and parse its JSON response.
 
-    Helper writes diagnostics to stderr and JSON to stdout.
+    Helper diagnostics are read from stderr and prefixed with the
+    helper PID.
+
+    The helper is allowed to remain open for up to HELPER_TIMEOUT
+    seconds.
     """
+    payload = (
+        json.dumps(
+            request,
+            ensure_ascii=False,
+        )
+        + "\n"
+    )
 
     log(
         "Starting kfile-helper: "
@@ -216,16 +377,11 @@ def run_helper(request):
     )
 
     try:
-        process = subprocess.run(
-            [HELPER],
-            input=json.dumps(
-                request,
-                ensure_ascii=False,
-            ) + "\n",
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=None,
-            check=False,
+        process = await asyncio.create_subprocess_exec(
+            HELPER,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
         )
 
     except OSError as exc:
@@ -235,21 +391,81 @@ def run_helper(request):
         )
         return None
 
+    stderr_task = asyncio.create_task(
+        read_helper_stderr(process)
+    )
+
+    try:
+        stdout, _ = await asyncio.wait_for(
+            process.communicate(
+                payload.encode("utf-8")
+            ),
+            timeout=HELPER_TIMEOUT,
+        )
+
+    except asyncio.TimeoutError:
+        await kill_process(
+            process,
+            f"timeout after {HELPER_TIMEOUT} seconds",
+        )
+
+        try:
+            await process.wait()
+        except Exception:
+            pass
+
+        log(
+            "kfile-helper timed out after "
+            f"{HELPER_TIMEOUT} seconds"
+        )
+
+        return None
+
+    except asyncio.CancelledError:
+        await kill_process(
+            process,
+            "request cancelled",
+        )
+
+        try:
+            await process.wait()
+        except Exception:
+            pass
+
+        raise
+
+    finally:
+        if not stderr_task.done():
+            stderr_task.cancel()
+
+        try:
+            await stderr_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            pass
+
     if process.returncode != 0:
         log(
             "kfile-helper exited with code "
             + str(process.returncode)
         )
 
-    stdout = process.stdout.strip()
+    stdout_text = stdout.decode(
+        "utf-8",
+        errors="replace",
+    ).strip()
 
-    if not stdout:
-        log("kfile-helper returned no stdout")
+    if not stdout_text:
+        log(
+            "kfile-helper returned no stdout"
+        )
         return None
 
-    # kfile-helper should normally output only one JSON object.
-    # Search backwards so diagnostic lines cannot break parsing.
-    lines = stdout.splitlines()
+    # kfile-helper normally writes one JSON object.
+    # Search backwards so accidental diagnostic lines cannot
+    # break parsing.
+    lines = stdout_text.splitlines()
 
     response_line = None
 
@@ -267,25 +483,24 @@ def run_helper(request):
         log(
             "Could not find JSON response from kfile-helper"
         )
+
         log(
             "Helper stdout: "
-            + repr(stdout)
+            + repr(stdout_text)
         )
+
         return None
 
     try:
-        response = json.loads(
-            response_line
-        )
+        return json.loads(response_line)
 
     except json.JSONDecodeError as exc:
         log(
             "Invalid JSON from kfile-helper: "
             + str(exc)
         )
-        return None
 
-    return response
+        return None
 
 
 # ============================================================
@@ -295,19 +510,18 @@ def run_helper(request):
 def make_success_response(response):
     """
     Build a successful portal response.
-
-    Returns an a{sv} dictionary.
     """
-
-    uris = response.get(
-        "uris",
-        [],
+    uris = normalize_uris(
+        response.get(
+            "uris",
+            [],
+        )
     )
 
     result = {
         "uris": Variant(
             "as",
-            list(uris),
+            uris,
         ),
     }
 
@@ -359,17 +573,134 @@ def make_success_response(response):
 
 
 # ============================================================
+# Request object
+# ============================================================
+
+class PortalRequest(ServiceInterface):
+    def __init__(self, path):
+        super().__init__(
+            REQUEST_INTERFACE
+        )
+
+        self.path = path
+        self.process = None
+        self.task = None
+
+    def set_process(self, process):
+        self.process = process
+
+    def set_task(self, task):
+        self.task = task
+
+    @method(name="Close")
+    async def close(self):
+        log(
+            f"Request.Close received for {self.path}"
+        )
+
+        await kill_process(
+            self.process,
+            "Request.Close",
+        )
+
+        if self.task is not None and not self.task.done():
+            self.task.cancel()
+
+
+# ============================================================
 # FileChooser D-Bus interface
 # ============================================================
 
 class FileChooser(ServiceInterface):
-
-    def __init__(self):
+    def __init__(self, bus):
         super().__init__(
             INTERFACE
         )
 
-        log("FileChooser interface initialized")
+        self.bus = bus
+        self.requests = {}
+
+        log(
+            "FileChooser interface initialized"
+        )
+
+    # --------------------------------------------------------
+    # Request handling
+    # --------------------------------------------------------
+
+    async def run_dialog(
+        self,
+        handle,
+        request,
+    ):
+        request_object = PortalRequest(
+            handle
+        )
+
+        self.requests[handle] = request_object
+
+        self.bus.export(
+            handle,
+            request_object,
+        )
+
+        current_task = asyncio.current_task()
+
+        request_object.set_task(
+            current_task
+        )
+
+        try:
+            response = await run_helper(
+                request
+            )
+
+        except asyncio.CancelledError:
+            log(
+                f"Portal request cancelled: {handle}"
+            )
+
+            raise
+
+        finally:
+            self.bus.unexport(
+                handle
+            )
+
+            self.requests.pop(
+                handle,
+                None,
+            )
+
+        if response is None:
+            log(
+                f"Helper failed for request: {handle}"
+            )
+
+            return [
+                2,
+                {},
+            ]
+
+        if not response.get(
+            "accepted",
+            False,
+        ):
+            log(
+                f"Dialog cancelled: {handle}"
+            )
+
+            return [
+                1,
+                {},
+            ]
+
+        return [
+            0,
+            make_success_response(
+                response
+            ),
+        ]
 
     # --------------------------------------------------------
     # OpenFile
@@ -384,6 +715,8 @@ class FileChooser(ServiceInterface):
         title: "s",
         options: "a{sv}",
     ) -> "ua{sv}":
+
+        del parent_window
 
         log(
             "OpenFile requested by "
@@ -406,49 +739,29 @@ class FileChooser(ServiceInterface):
             )
         )
 
+        accept_label = get_option(
+            options,
+            "accept_label",
+            "",
+        )
+
         if directory:
             operation = "directory"
-
         else:
             operation = "open"
 
         request = build_request(
             operation=operation,
             options=options,
+            title=title,
+            accept_label=accept_label,
             multiple=multiple,
         )
 
-        response = run_helper(
-            request
+        return await self.run_dialog(
+            handle.path,
+            request,
         )
-
-        if response is None:
-            log("Helper failed")
-
-            return [
-                2,
-                {},
-            ]
-
-        if not response.get(
-            "accepted",
-            False,
-        ):
-            log("Dialog cancelled")
-
-            return [
-                1,
-                {},
-            ]
-
-        result = make_success_response(
-            response
-        )
-
-        return [
-            0,
-            result,
-        ]
 
     # --------------------------------------------------------
     # SaveFile
@@ -464,6 +777,8 @@ class FileChooser(ServiceInterface):
         options: "a{sv}",
     ) -> "ua{sv}":
 
+        del parent_window
+
         log(
             "SaveFile requested by "
             + repr(app_id)
@@ -475,44 +790,24 @@ class FileChooser(ServiceInterface):
             "",
         )
 
+        accept_label = get_option(
+            options,
+            "accept_label",
+            "",
+        )
+
         request = build_request(
             operation="save",
             options=options,
-            multiple=False,
+            title=title,
+            accept_label=accept_label,
             current_name=current_name,
         )
 
-        response = run_helper(
-            request
+        return await self.run_dialog(
+            handle.path,
+            request,
         )
-
-        if response is None:
-            log("Helper failed")
-
-            return [
-                2,
-                {},
-            ]
-
-        if not response.get(
-            "accepted",
-            False,
-        ):
-            log("Dialog cancelled")
-
-            return [
-                1,
-                {},
-            ]
-
-        result = make_success_response(
-            response
-        )
-
-        return [
-            0,
-            result,
-        ]
 
     # --------------------------------------------------------
     # SaveFiles
@@ -528,55 +823,51 @@ class FileChooser(ServiceInterface):
         options: "a{sv}",
     ) -> "ua{sv}":
 
+        del parent_window
+
         log(
             "SaveFiles requested by "
             + repr(app_id)
         )
 
-        current_name = get_option(
+        files_raw = get_option(
             options,
-            "current_name",
-            "",
+            "files",
+            [],
         )
 
-        request = build_request(
-            operation="save",
-            options=options,
-            multiple=True,
-            current_name=current_name,
+        files = decode_filename_list(
+            files_raw
         )
 
-        response = run_helper(
-            request
-        )
-
-        if response is None:
-            log("Helper failed")
+        if not files:
+            log(
+                "SaveFiles request contains no files"
+            )
 
             return [
                 2,
                 {},
             ]
 
-        if not response.get(
-            "accepted",
-            False,
-        ):
-            log("Dialog cancelled")
-
-            return [
-                1,
-                {},
-            ]
-
-        result = make_success_response(
-            response
+        accept_label = get_option(
+            options,
+            "accept_label",
+            "",
         )
 
-        return [
-            0,
-            result,
-        ]
+        request = build_request(
+            operation="save_files",
+            options=options,
+            title=title,
+            accept_label=accept_label,
+            files=files,
+        )
+
+        return await self.run_dialog(
+            handle.path,
+            request,
+        )
 
 
 # ============================================================
@@ -584,12 +875,13 @@ class FileChooser(ServiceInterface):
 # ============================================================
 
 async def main():
-
     log("Starting")
 
     bus = await MessageBus().connect()
 
-    interface = FileChooser()
+    interface = FileChooser(
+        bus
+    )
 
     bus.export(
         OBJECT_PATH,
@@ -611,10 +903,7 @@ async def main():
 
 
 if __name__ == "__main__":
-
     try:
-        import asyncio
-
         asyncio.run(
             main()
         )
@@ -627,4 +916,5 @@ if __name__ == "__main__":
             "Fatal error: "
             + repr(exc)
         )
+
         raise
