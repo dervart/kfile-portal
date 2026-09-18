@@ -181,6 +181,7 @@ def convert_filters(filters):
 
             if filter_type == 0:
                 globs.append(value)
+
             elif filter_type == 1:
                 mimes.append(value)
 
@@ -350,7 +351,7 @@ async def read_helper_stderr(process):
         )
 
 
-async def run_helper(request, cancel_event=None):
+async def run_helper(request, request_object=None):
     """
     Execute kfile-helper and parse its JSON response.
 
@@ -359,6 +360,10 @@ async def run_helper(request, cancel_event=None):
 
     The helper is allowed to remain open for up to HELPER_TIMEOUT
     seconds.
+
+    If request_object is provided, the helper process is registered
+    with the corresponding portal request so Request.Close can
+    terminate it directly.
     """
     payload = (
         json.dumps(
@@ -391,15 +396,42 @@ async def run_helper(request, cancel_event=None):
         )
         return None
 
+    # Register the helper immediately after it starts.
+    # This allows Request.Close to terminate the actual helper
+    # process while the dialog is open.
+    if request_object is not None:
+        request_object.set_process(process)
+
     stderr_task = asyncio.create_task(
         read_helper_stderr(process)
     )
 
+    stdout = b""
+
     try:
-        stdout, _ = await asyncio.wait_for(
-            process.communicate(
+        # Send the request to the helper.
+        if process.stdin is not None:
+            process.stdin.write(
                 payload.encode("utf-8")
-            ),
+            )
+
+            await process.stdin.drain()
+            process.stdin.close()
+
+        # Read stdout directly.
+        #
+        # Do NOT use process.communicate() here because stderr is
+        # already being read by read_helper_stderr(). communicate()
+        # would create a second concurrent reader for stderr.
+        if process.stdout is not None:
+            stdout = await asyncio.wait_for(
+                process.stdout.read(),
+                timeout=HELPER_TIMEOUT,
+            )
+
+        # Wait until the helper exits.
+        await asyncio.wait_for(
+            process.wait(),
             timeout=HELPER_TIMEOUT,
         )
 
@@ -434,16 +466,36 @@ async def run_helper(request, cancel_event=None):
 
         raise
 
-    finally:
-        if not stderr_task.done():
-            stderr_task.cancel()
+    except Exception as exc:
+        await kill_process(
+            process,
+            f"helper I/O failed: {exc}",
+        )
 
+        try:
+            await process.wait()
+        except Exception:
+            pass
+
+        log(
+            "kfile-helper I/O failed: "
+            + str(exc)
+        )
+
+        return None
+
+    finally:
+        # stderr has its own dedicated reader.
+        # Wait for it to finish after the helper exits.
         try:
             await stderr_task
         except asyncio.CancelledError:
             pass
         except Exception:
             pass
+
+        if request_object is not None:
+            request_object.set_process(None)
 
     if process.returncode != 0:
         log(
@@ -498,6 +550,11 @@ async def run_helper(request, cancel_event=None):
         log(
             "Invalid JSON from kfile-helper: "
             + str(exc)
+        )
+
+        log(
+            "Helper stdout: "
+            + repr(stdout_text)
         )
 
         return None
@@ -652,7 +709,8 @@ class FileChooser(ServiceInterface):
 
         try:
             response = await run_helper(
-                request
+                request,
+                request_object,
             )
 
         except asyncio.CancelledError:
@@ -759,7 +817,7 @@ class FileChooser(ServiceInterface):
         )
 
         return await self.run_dialog(
-            handle.path,
+            handle,
             request,
         )
 
@@ -805,7 +863,7 @@ class FileChooser(ServiceInterface):
         )
 
         return await self.run_dialog(
-            handle.path,
+            handle,
             request,
         )
 
@@ -865,7 +923,7 @@ class FileChooser(ServiceInterface):
         )
 
         return await self.run_dialog(
-            handle.path,
+            handle,
             request,
         )
 
