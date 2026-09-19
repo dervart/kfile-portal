@@ -1,4 +1,5 @@
 #!/bin/bash
+
 set -euo pipefail
 
 # ============================================================
@@ -19,21 +20,26 @@ USER_BACKUP="${USER_CONFIG}.kfile-backup"
 
 STALE_KDIALOG="${HOME}/.local/share/xdg-desktop-portal/portals/kdialog.portal"
 
+
 # ============================================================
 # Helpers
 # ============================================================
 
-die() {
+die()
+{
     echo "Error: $*" >&2
     exit 1
 }
 
+
 # ============================================================
 # Package manager detection
 #
-# Only the package manager is auto-detected. Package names for
-# the same dependency differ between distributions, so a
-# separate list is kept for each supported package manager.
+# Arch + Niri is the tested configuration.
+#
+# Other package managers are retained as experimental support.
+# Their package names and installation commands have not been
+# tested by the project.
 # ============================================================
 
 PKG_MANAGER=""
@@ -48,15 +54,22 @@ elif command -v zypper >/dev/null 2>&1; then
     PKG_MANAGER="zypper"
 fi
 
-# Parallel arrays: same index means the same logical dependency
-# (python3, dbus-next, xdg-desktop-portal, KIO dev files,
-# Qt6 base dev files, cmake, C++ compiler).
+
+# ============================================================
+# Package lists
+#
+# Arch is the tested configuration.
+#
+# The other lists are best-effort package name guesses and have
+# not been tested.
+# ============================================================
 
 PACMAN_PACKAGES=(
     python
     python-dbus-next
     xdg-desktop-portal
     kio
+    kio-fuse
     qt6-base
     cmake
     gcc
@@ -67,6 +80,7 @@ APT_PACKAGES=(
     python3-dbus-next
     xdg-desktop-portal
     libkf6kio-dev
+    kio-fuse
     qt6-base-dev
     cmake
     g++
@@ -77,6 +91,7 @@ DNF_PACKAGES=(
     python3-dbus-next
     xdg-desktop-portal
     kf6-kio-devel
+    kio-fuse
     qt6-qtbase-devel
     cmake
     gcc-c++
@@ -87,12 +102,15 @@ ZYPPER_PACKAGES=(
     python3-dbus-next
     xdg-desktop-portal
     kf6-kio-devel
+    kio-fuse
     qt6-base-devel
     cmake
     gcc-c++
 )
 
-check_package() {
+
+check_package()
+{
     local package="$1"
 
     case "${PKG_MANAGER}" in
@@ -111,7 +129,9 @@ check_package() {
     esac
 }
 
-install_package() {
+
+install_package()
+{
     local package="$1"
 
     echo "Installing missing package: ${package}"
@@ -135,6 +155,7 @@ install_package() {
     esac
 }
 
+
 # ============================================================
 # Basic checks
 # ============================================================
@@ -157,6 +178,7 @@ fi
 
 echo "Requesting administrator privileges..."
 sudo -v
+
 
 # ============================================================
 # Package checks
@@ -185,9 +207,16 @@ case "${PKG_MANAGER}" in
         echo "Skipping automatic package checks."
         echo "Make sure the following are installed manually:"
         echo
-        echo "  Python 3, python-dbus-next, xdg-desktop-portal,"
-        echo "  KDE Frameworks 6 KIO (development files),"
-        echo "  Qt6 base (development files), CMake, a C++ compiler."
+        echo "  Python 3"
+        echo "  python-dbus-next"
+        echo "  xdg-desktop-portal"
+        echo "  KDE Frameworks 6 KIO"
+        echo "  kio-fuse"
+        echo "  Qt6 base"
+        echo "  CMake"
+        echo "  A C++ compiler"
+        echo
+        echo "Note: Arch + Niri is the only tested configuration."
         REQUIRED_PACKAGES=()
         ;;
 esac
@@ -208,6 +237,7 @@ if [[ ${#MISSING_PACKAGES[@]} -gt 0 ]]; then
     done
 
     echo
+
     read -r -p "Install missing packages now? [y/N] " answer
 
     case "${answer}" in
@@ -223,6 +253,7 @@ if [[ ${#MISSING_PACKAGES[@]} -gt 0 ]]; then
 elif [[ ${#REQUIRED_PACKAGES[@]} -gt 0 ]]; then
     echo "All required packages are installed."
 fi
+
 
 # ============================================================
 # Source files
@@ -243,6 +274,7 @@ fi
 [[ -f "${SCRIPT_DIR}/org.freedesktop.impl.portal.desktop.kfile.service" ]] ||
     die "Missing D-Bus service file: ${SCRIPT_DIR}/org.freedesktop.impl.portal.desktop.kfile.service"
 
+
 # ============================================================
 # Build
 # ============================================================
@@ -250,7 +282,8 @@ fi
 BUILD_DIR="$(mktemp -d)"
 TMP_CONFIG="$(mktemp)"
 
-cleanup() {
+cleanup()
+{
     rm -rf "${BUILD_DIR}"
     rm -f "${TMP_CONFIG}"
 }
@@ -270,6 +303,7 @@ cmake \
 
 [[ -x "${BUILD_DIR}/kfile-helper" ]] ||
     die "kfile-helper was not built successfully."
+
 
 # ============================================================
 # Install system files
@@ -300,6 +334,7 @@ sudo install -Dm644 \
     "${SCRIPT_DIR}/org.freedesktop.impl.portal.desktop.kfile.service" \
     "${DBUS_SERVICE}"
 
+
 # ============================================================
 # Niri portal configuration
 #
@@ -329,7 +364,10 @@ else
     # Create a backup before modifying an existing configuration.
     if [[ ! -f "${USER_BACKUP}" ]]; then
         echo "Creating backup of existing Niri portal configuration..."
-        cp -a "${USER_CONFIG}" "${USER_BACKUP}"
+
+        cp -a \
+            "${USER_CONFIG}" \
+            "${USER_BACKUP}"
 
         echo "Backup:"
         echo "  ${USER_BACKUP}"
@@ -338,13 +376,11 @@ else
         echo "  ${USER_BACKUP}"
     fi
 
-    # Use Python for robust modification of the portals.conf file.
+    # Use Python for robust modification of portals.conf.
     #
-    # We deliberately modify only:
-    #
-    #   org.freedesktop.impl.portal.FileChooser
-    #
+    # Only the FileChooser entry is changed.
     # Existing unrelated settings are preserved.
+
     python3 - "${USER_CONFIG}" "${TMP_CONFIG}" <<'PY'
 import sys
 
@@ -357,7 +393,6 @@ with open(source, "r", encoding="utf-8") as f:
 preferred_start = None
 preferred_end = None
 
-# Locate the [preferred] section.
 for index, line in enumerate(lines):
     stripped = line.strip()
 
@@ -379,13 +414,16 @@ filechooser_key = "org.freedesktop.impl.portal.FileChooser"
 replacement = f"{filechooser_key}=kfile;\n"
 
 if preferred_start is not None:
-    # Look for an existing FileChooser entry inside [preferred].
     found = False
 
     for index in range(preferred_start + 1, preferred_end):
         stripped = lines[index].strip()
 
-        if not stripped or stripped.startswith("#") or stripped.startswith(";"):
+        if (
+            not stripped
+            or stripped.startswith("#")
+            or stripped.startswith(";")
+        ):
             continue
 
         if "=" not in stripped:
@@ -397,13 +435,9 @@ if preferred_start is not None:
             lines[index] = replacement
             found = True
 
-    # If there was no existing FileChooser entry,
-    # insert one immediately after [preferred].
     if not found:
         insert_at = preferred_start + 1
 
-        # Keep comments and blank lines directly following
-        # [preferred] before inserting the new setting.
         while insert_at < preferred_end:
             stripped = lines[insert_at].strip()
 
@@ -420,10 +454,6 @@ if preferred_start is not None:
         lines.insert(insert_at, replacement)
 
 else:
-    # No [preferred] section exists.
-    #
-    # Preserve the entire existing configuration and append
-    # a new [preferred] section.
     if lines and not lines[-1].endswith("\n"):
         lines[-1] += "\n"
 
@@ -437,7 +467,6 @@ with open(destination, "w", encoding="utf-8") as f:
     f.writelines(lines)
 PY
 
-    # Avoid rewriting the file when nothing actually changed.
     if cmp -s "${USER_CONFIG}" "${TMP_CONFIG}"; then
         echo "Niri portal configuration is already correct."
         rm -f "${TMP_CONFIG}"
@@ -453,6 +482,7 @@ PY
     fi
 fi
 
+
 # ============================================================
 # Remove obsolete local KDialog portal
 # ============================================================
@@ -467,12 +497,12 @@ if [[ -f "${STALE_KDIALOG}" ]]; then
     echo "  ${STALE_KDIALOG}"
 fi
 
-# Remove empty parent directory if it became unused.
 STALE_KDIALOG_DIR="$(dirname "${STALE_KDIALOG}")"
 
 if [[ -d "${STALE_KDIALOG_DIR}" ]]; then
     rmdir "${STALE_KDIALOG_DIR}" 2>/dev/null || true
 fi
+
 
 # ============================================================
 # Restart portal
@@ -491,6 +521,7 @@ else
     echo "  systemctl --user restart xdg-desktop-portal.service"
 fi
 
+
 # ============================================================
 # Installation summary
 # ============================================================
@@ -500,21 +531,35 @@ echo "============================================================"
 echo "Installation completed successfully."
 echo "============================================================"
 echo
+
 echo "Installed:"
 echo "  ${BACKEND}"
 echo "  ${HELPER}"
 echo "  ${PORTAL}"
 echo "  ${DBUS_SERVICE}"
+
+echo
+echo "Required runtime dependency:"
+echo "  kio-fuse"
+
 echo
 echo "Niri configuration:"
 echo "  ${USER_CONFIG}"
+
 echo
 echo "FileChooser backend:"
 echo "  org.freedesktop.impl.portal.FileChooser=kfile;"
+
 echo
 echo "The kfile backend is activated automatically by D-Bus."
+
 echo
-echo "You can verify it with:"
+echo "Verify the backend with:"
 echo
 echo "  busctl --user status org.freedesktop.impl.portal.desktop.kfile"
+
+echo
+echo "For diagnostic logging, use:"
+echo
+echo "  KFILE_PORTAL_DEBUG=1"
 echo
