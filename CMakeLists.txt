@@ -6,7 +6,11 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_AUTOMOC ON)
 
-find_package(Qt6 6.4 REQUIRED COMPONENTS Widgets)
+find_package(Qt6 6.4 REQUIRED COMPONENTS
+    Widgets
+    DBus
+)
+
 find_package(KF6KIO REQUIRED)
 
 # KF6KIO exports KF6::KIOWidgets / KF6::KIOFileWidgets targets directly;
@@ -24,6 +28,7 @@ add_executable(kfile-helper
 # carry their public include directories as usage requirements.
 target_link_libraries(kfile-helper PRIVATE
     Qt6::Widgets
+    Qt6::DBus
     KF6::KIOFileWidgets
     KF6::KIOWidgets
 )
